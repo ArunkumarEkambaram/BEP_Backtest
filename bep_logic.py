@@ -8,11 +8,11 @@ import config
 
 
 def qualify(first_candle, bep: float) -> bool:
-    """The 09:15-09:20 qualification: candle TOUCHED BEP and CLOSED above it."""
+    """The 09:15-09:20 qualification: candle TOUCHED BEP, CLOSED above it, AND is green."""
     if first_candle is None or bep is None:
         return False
-    low, high, close = float(first_candle[3]), float(first_candle[2]), float(first_candle[4])
-    return low <= bep <= high and close > bep
+    o, h, l, c = float(first_candle[1]), float(first_candle[2]), float(first_candle[3]), float(first_candle[4])
+    return l <= bep <= h and c > bep and c > o
 
 
 def branch(close: float, bep: float) -> str:
@@ -22,11 +22,11 @@ def branch(close: float, bep: float) -> str:
 
 
 def flip_close_above(candle, bep: float) -> bool:
-    """A fresh touch + close-above flip (used for a parked leg's re-entry)."""
+    """A fresh touch + close-above flip AND is green (used for parked legs and re-entries)."""
     if candle is None or bep is None:
         return False
-    low, high, close = float(candle[3]), float(candle[2]), float(candle[4])
-    return low <= bep <= high and close > bep
+    o, h, l, c = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4])
+    return l <= bep <= h and c > bep and c > o
 
 
 def limit_touched(candle, bep: float) -> bool:

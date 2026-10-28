@@ -137,71 +137,92 @@ def _run_leg(strike: int, leg: str, bep_level: float, candles: list):
     for idx, candle in enumerate(candles):
         key = _candle_key(candle)
         prev_state = state
+        o, h, l, c = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4])
 
         if state == "IDLE":
             if idx == 0:
-                if not bep_logic.qualify(candle, bep_level):
-                    state = "DEAD"
-                else:
+                # 09:15 Candle
+                if l <= bep_level <= h and c > bep_level and c > o:
+                    # Green + touched + closed above
                     action = bep_logic.branch(first_close, bep_level)
-                    branch_label = "<=10" if action == "enter_next_open" else ">10"
                     if action == "enter_next_open":
+                        branch_label = "<=10"
                         state = "ARM_NEXT_OPEN"
                     else:
+                        branch_label = ">10"
                         state = "PARKED"
                         park_start_idx = idx
+                
+                elif l <= bep_level <= h and c > bep_level:
+                    # Red + touched + closed above. Force wait for a green flip.
+                    branch_label = "<=10" 
+                    state = "PARKED"
+                    park_start_idx = idx
+                else:
+                    state = "DEAD"
             
-            # Kill switch for re-entry: if idle and candle closes below BEP, die.
-            elif bep_logic.closed_below(candle, bep_level):
+            # Kill switch for re-entries
+            elif c < bep_level:
                 state = "DEAD"
                 
+            # Green flip for re-entry
             elif trades_taken < config.MAX_TRADES_PER_LEG and \
-                    bep_logic.flip_close_above(candle, bep_level):
-                
-                action = bep_logic.branch(float(candle[4]), bep_level)
-                branch_label = "<=10" if action == "enter_next_open" else ">10"
+                    l <= bep_level <= h and c > bep_level and c > o:
+                action = bep_logic.branch(c, bep_level)
                 if action == "enter_next_open":
+                    branch_label = "<=10"
                     state = "ARM_NEXT_OPEN"
                 else:
+                    branch_label = ">10"
                     state = "PARKED"
                     park_start_idx = idx
 
         elif state == "ARM_NEXT_OPEN" and idx > 0:
+            # Market entry at the next candle open
             entry_fill = trade_sim.open_fill(candle)
             current_trade = _new_trade(strike, leg, branch_label, first, entry_fill, trades_taken + 1, bep_level)
             state = "IN_TRADE"
 
         elif state == "PARKED":
-            if bep_logic.closed_below(candle, bep_level):
+            if c < bep_level:
                 state = "DEAD"
-            elif (park_start_idx is not None) and \
-                    (idx - park_start_idx) <= config.PARK_CANDLES and \
-                    bep_logic.limit_touched(candle, bep_level):
-                entry_fill = trade_sim.limit_fill(bep_level, candle)
-                current_trade = _new_trade(strike, leg, branch_label, first, entry_fill, trades_taken + 1, bep_level)
-                state = "IN_TRADE"
-            elif (park_start_idx is not None) and (idx - park_start_idx) > config.PARK_CANDLES:
-                if bep_logic.flip_close_above(candle, bep_level) and \
-                        trades_taken < config.MAX_TRADES_PER_LEG:
-                    action = bep_logic.branch(float(candle[4]), bep_level)
-                    branch_label = "<=10" if action == "enter_next_open" else ">10"
+            
+            # If it's a >10 branch, we strictly wait for the limit fill (BEP + 1)
+            elif branch_label == ">10":
+                if (idx - park_start_idx) <= config.PARK_CANDLES and l <= (bep_level + 1.0):
+                    # The low MUST be <= BEP + 1 for this to trigger.
+                    entry_fill = trade_sim.limit_fill(bep_level, candle)
+                    current_trade = _new_trade(strike, leg, branch_label, first, entry_fill, trades_taken + 1, bep_level)
+                    state = "IN_TRADE"
+                elif (idx - park_start_idx) > config.PARK_CANDLES:
+                    # Timer expired. Wait for a green flip to enter at next open.
+                    if l <= bep_level <= h and c > bep_level and c > o:
+                        branch_label = "<=10" # Enter at next open after the timer expires
+                        state = "ARM_NEXT_OPEN"
+
+            # If it's a <=10 branch (parked due to red candle), wait for a green flip.
+            elif branch_label == "<=10":
+                if l <= bep_level <= h and c > bep_level and c > o:
+                    action = bep_logic.branch(c, bep_level)
                     if action == "enter_next_open":
+                        branch_label = "<=10"
                         state = "ARM_NEXT_OPEN"
                     else:
-                        state = "PARKED"
+                        # If the new gap is >10, we go back to parked with a limit order
+                        branch_label = ">10"
                         park_start_idx = idx
 
         elif state == "IN_TRADE" and entry_fill is not None:
             if _candle_key(candle) == entry_fill.time:
                 pass  # entry candle: no exit check
-            elif bep_logic.target_hit(candle, entry_fill.price):
+            elif h >= entry_fill.price + config.TARGET_POINTS:
                 exit_fill = trade_sim.target_fill(candle, entry_fill.price)
                 current_trade.close(exit_fill)
                 trades.append(current_trade)
                 trades_taken += 1
                 entry_fill = current_trade = None
                 state = "IDLE" if trades_taken < config.MAX_TRADES_PER_LEG else "DONE"
-            elif bep_logic.closed_below(candle, bep_level):
+            elif c < bep_level:
                 exit_fill = trade_sim.sl_fill(candle)
                 current_trade.close(exit_fill)
                 trades.append(current_trade)
@@ -209,13 +230,12 @@ def _run_leg(strike: int, leg: str, bep_level: float, candles: list):
                 entry_fill = current_trade = None
                 state = "IDLE" if trades_taken < config.MAX_TRADES_PER_LEG else "DONE"
             
-            # IMMEDIATE KILL SWITCH: If we just exited a trade and this exact candle 
-            # closed below BEP, kill the strike permanently for the day.
-            if state in ("IDLE", "DONE") and bep_logic.closed_below(candle, bep_level):
+            # IMMEDIATE KILL SWITCH: If we just exited and this candle closed below BEP, kill it.
+            if state in ("IDLE", "DONE") and c < bep_level:
                 state = "DEAD"
 
         cells[key] = _board_cell(strike, leg, prev_state, state, bep_level,
-                                 float(candle[4]), current_trade, trades_taken)
+                                 c, current_trade, trades_taken)
 
     return trades, cells
 
